@@ -52,6 +52,11 @@ class Login(Action):
     def __init__(self):
         super(Login, self).__init__()
 
+        # dump environ for debugging
+        if self.config['debug']:
+            for name, value in os.environ.iteritems():
+              sys.stderr.write('%s = %s\n' % (name, value))
+
         # setup timeout
         signal.signal(signal.SIGALRM, self.fail)
 
@@ -74,6 +79,14 @@ class Login(Action):
         if not self.config['secret']:
             self.success()
 
+        # is the code set in environment?
+        code = os.environ.get('OTP', '')
+        if code:
+            if self.check(code):
+                self.success()
+            else:
+                self.fail()
+
         # setup timeout
         signal.alarm(self.config['timeout'])
 
@@ -81,7 +94,10 @@ class Login(Action):
         try:
             while True:
                 # get code
-                code = raw_input('One-time password: ').strip()
+                sys.stderr.write('One-time password: ')
+                sys.stderr.flush()
+
+                code = raw_input().strip()
                 if self.check(code):
                     break
 
