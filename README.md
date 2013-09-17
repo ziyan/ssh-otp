@@ -27,9 +27,9 @@ Generate one-time password secret for current user:
 
     ssh-otp setup
 
-Test your authenticator:
-
-    ssh-otp test
+You will need to set up your authenticator using the QR code link
+and type in the displayed code on your authenticator to actually enable
+one-time password authentication on SSH conneciton.
 
 
 Disable
