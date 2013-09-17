@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+
+from __future__ import with_statement
+import sys
+import os
+import yaml
+import argparse
+import signal
+import hmac
+import hashlib
+import struct
+import base64
+import time
+import socket
+import urllib
+
+class Action(object):
+    """
+    Action base.
+    """
+
+    def __init__(self):
+        """
+        Loads configuration from ~/.ssh/otp
+        """
+
+        self.config = {
+            'debug': False,
+            'secret': '',
+            'timeout': 60,
+            'delay': 3,
+            'drift_backward': 1,
+            'drift_forward': 1,
+        }
+        self.config_path = os.path.join(os.environ['HOME'], '.ssh', 'otp')
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.config_path, 'rb') as f:
+                self.config.update(yaml.load(f) or {})
+        except IOError:
+            pass
+
+    def save(self):
+        with open(self.config_path, 'wb') as f:
+            yaml.dump(self.config, f, default_flow_style=False)
+        os.chmod(self.config_path, 0600)
+
+class Login(Action):
+
+    def __init__(self):
+        super(Login, self).__init__()
+
+        # setup timeout
+        signal.signal(signal.SIGALRM, self.fail)
+
+    def shell(self, command=''):
+        if command:
+            os.execl('/bin/bash', '/bin/bash', '-c', command)
+        else:
+            shell = os.environ['SHELL']
+            os.execl(shell, shell)
+        assert False
+
+    def success(self):
+        self.shell(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
+
+    def fail(self, *args, **kwargs):
+        os._exit(1)
+
+    def run(self):
+        # if secret not setup, then simply run shell
+        if not self.config['secret']:
+            self.success()
+
+        # setup timeout
+        signal.alarm(self.config['timeout'])
+
+        # let user try until success or timeout
+        try:
+            while True:
+                # get code
+                code = raw_input('One-time password: ').strip()
+                if self.check(code):
+                    break
+
+                # delay
+                time.sleep(self.config['delay'])
+                sys.stderr.write('Incorrect code. Please try again.\n\n')
+
+        except:
+            self.fail()
+
+        # disable timeout
+        signal.alarm(0)
+
+        self.success()
+
+    def check(self, code):
+        drift_backward = max(0, self.config['drift_backward'])
+        drift_forward = max(0, self.config['drift_forward'])
+
+        for drift in range(-drift_backward, drift_forward + 1):
+            if code == self.totp(self.config['secret'], drift=drift):
+                return True
+        return False
+
+    def totp(self, key, length=6, hash=hashlib.sha1, period=30, drift=0):
+        counter = int(int(time.time()) / period) + drift
+        return self.hotp(key, counter, length=length, hash=hash, drift=0)
+
+    def hotp(self, key, counter, length=6, hash=hashlib.sha1, drift=0):
+        counter = struct.pack('>Q', counter + drift)
+        key = base64.b32decode(key)
+
+        digest = hmac.new(key, counter, hash).digest()
+
+        offset = ord(digest[-1]) & 0xF
+        value = struct.unpack('>L', digest[offset:offset + 4])[0] & 0x7FFFFFFFL
+        code = ('%010d' % value)[-length:]
+        return code
+
+
+class Test(Login):
+
+    def success(self):
+        sys.stdout.write('Successful!\n')
+        sys.exit(0)
+
+    def fail(self):
+        sys.stdout.write('\nTest failed!\n')
+        sys.exit(1)
+
+    def run(self):
+        if not self.config['secret']:
+            sys.stderr.write('One-time password has not yet been set up.')
+            self.fail()
+
+        super(Test, self).run()
+
+
+class Setup(Action):
+
+    def run(self):
+
+        if not self.config['secret']:
+            self.config['secret'] = self.generate()
+            self.save()
+
+        sys.stderr.write('Secret:\n%s\n\n' % self.config['secret'])
+        otpauth_url = 'otpauth://totp'
+        otpauth_url += urllib.quote('/ssh %s@%s' % (os.environ['USER'], socket.gethostname()))
+        otpauth_url += '?' + urllib.urlencode({
+            'secret': self.config['secret']
+        })
+        sys.stdout.write('OTP Auth URL:\n%s\n\n' % otpauth_url)
+
+
+        qrcode_url = 'https://chart.googleapis.com/chart?' + urllib.urlencode({
+            'cht': 'qr',
+            'chs': '512x512',
+            'chl': otpauth_url,
+        })
+        sys.stdout.write('QR Code URL:\n%s\n\n' % qrcode_url)
+
+    def generate(self):
+        # 320 bit of entropy
+        secret = os.urandom(40)
+        secret = base64.b32encode(secret)
+        return secret
+
+class Reset(Action):
+    def run(self):
+        if 'secret' in self.config:
+            del self.config['secret']
+        self.save()
+
+ACTIONS = {
+    'login': Login,
+    'test': Test,
+    'setup': Setup,
+    'reset': Reset,
+}
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='SSH One-time Password Authentication')
+    parser.add_argument('action', choices=ACTIONS.keys())
+    return parser.parse_args()
+
+def main(args):
+    action_cls = ACTIONS[args.action]
+    action = action_cls()
+    action.run()
+
+if __name__ == '__main__':
+    main(parse_args())
