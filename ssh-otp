@@ -90,7 +90,7 @@ class Login(Action):
             os.execl('/bin/bash', '/bin/bash', '-c', command)
         else:
             shell = os.environ['SHELL']
-            os.execl(shell, shell)
+            os.execl(shell, shell, '-l')
         assert False
 
     def success(self):
