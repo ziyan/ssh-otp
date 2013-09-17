@@ -43,9 +43,9 @@ and type in the displayed code on your authenticator to actually enable
 one-time password authentication on SSH conneciton.
 
 
-You can find configuration file at:
+You can find the configuration file at:
 
-   ~/.ssh/otp
+    ~/.ssh/otp
 
 
 Disable
