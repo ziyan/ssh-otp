@@ -1,6 +1,8 @@
 ssh-otp
 =======
 
+The following instructions are based on ubuntu, but they can be adapted for other Linux distributions.
+
 Installation
 ------------
 
@@ -15,7 +17,7 @@ Add the following line in your `/etc/ssh/sshd_config`:
 
 And restart sshd:
 
-    restart ssh
+    sudo restart ssh
 
 
 Enable
