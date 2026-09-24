@@ -13,15 +13,16 @@ Add one-time password authentication to your SSH server.
 
 
 The following instructions are based on ubuntu, but they can be adapted for other Linux distributions.
-Depending on linux distribution Python 2 or Python 3 may be installed, ssh-otp supports both.
+`ssh-otp` runs on Python 3 or Python 2.7, whichever is installed, and needs no
+extra Python packages. Install `qrencode` to have `setup` show a QR code.
 
 Installation
 ------------
 
-Copy `ssh-otp` and `ssh-otp.py` to `/usr/local/bin`:
+Copy `ssh-otp` to `/usr/local/bin`:
 
     sudo mkdir -p /usr/local/bin
-    sudo cp ssh-otp ssh-otp.py
+    sudo cp ssh-otp /usr/local/bin/
 
 Add the following line in your `/etc/ssh/sshd_config`:
 

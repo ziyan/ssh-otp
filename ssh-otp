@@ -1,46 +1,310 @@
-#!/bin/bash
-# Smart Python launcher that tries python3, python, then python2
-# This script automatically finds the best available Python interpreter
+#!/bin/sh
+''''true; for python in python3 python python2; do command -v "$python" >/dev/null 2>&1 && exec "$python" "$0" "$@"; done; echo "ssh-otp: no python interpreter found" >&2; exit 1 # '''
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="$SCRIPT_DIR/ssh-otp.py"
+# The line above is read by sh, which runs this file again with the first
+# Python it finds, and by Python, which sees a string and moves on. It works
+# on Python 2.7 and Python 3. When no Python is found, it exits and the login
+# is refused: a second factor must fail closed.
 
-# Fallback function - single exit point
-fallback_to_shell() {
-    echo "Warning: Allowing fallback access to prevent lockout" >&2
-    exec /bin/bash -l
+from __future__ import print_function
+import sys
+import os
+import re
+import argparse
+import signal
+import hmac
+import hashlib
+import struct
+import base64
+import time
+import socket
+import subprocess
+
+try:
+    from urllib.parse import quote, urlencode
+    read_line = input
+except ImportError:
+    from urllib import quote, urlencode
+    read_line = raw_input  # noqa: F821 (Python 2)
+
+
+class ConfigError(Exception):
+    pass
+
+
+def parse_config(content):
+    """
+    Reads the flat "key: value" YAML that ssh-otp writes, including files
+    written by earlier versions through PyYAML. Anything else is an error
+    rather than being skipped, so a damaged file cannot switch OTP off.
+    """
+    config = {}
+    for line_number, line in enumerate(content.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        match = re.match(r'^(\w+):\s*(.*)$', line)
+        if not match:
+            raise ConfigError('line %d: expected "key: value"' % line_number)
+        key, value = match.group(1), match.group(2).strip()
+        # PyYAML on Python 2 may tag strings with their Python type.
+        value = re.sub(r'^!!python/(unicode|str)\s+', '', value)
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            config[key] = value[1:-1].replace("''", "'")
+        elif len(value) >= 2 and value[0] == value[-1] == '"':
+            config[key] = value[1:-1]
+        elif value.lower() in ('true', 'false'):
+            config[key] = value.lower() == 'true'
+        elif re.match(r'^-?\d+$', value):
+            config[key] = int(value)
+        else:
+            config[key] = value
+    return config
+
+
+def format_config(config):
+    lines = []
+    for key in sorted(config):
+        value = config[key]
+        if isinstance(value, bool):
+            text = 'true' if value else 'false'
+        elif isinstance(value, int):
+            text = str(value)
+        else:
+            text = "'%s'" % str(value).replace("'", "''")
+        lines.append('%s: %s\n' % (key, text))
+    return ''.join(lines)
+
+
+class Action(object):
+    """
+    Action base.
+    """
+
+    def __init__(self):
+        """
+        Loads configuration from ~/.ssh/otp
+        """
+
+        self.config = {
+            'debug': False,
+            'enable': False,
+            'secret': '',
+            'timeout': 120,
+            'delay': 3,
+            'drift_backward': 1,
+            'drift_forward': 1,
+        }
+        self.config_path = os.path.join(os.environ['HOME'], '.ssh', 'otp')
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.config_path, 'rb') as f:
+                content = f.read().decode('utf-8')
+        except (IOError, OSError):
+            # No file yet: one-time password was never set up.
+            return
+        # A file that does not parse raises, which refuses the login.
+        self.config.update(parse_config(content))
+
+    def save(self):
+        # Created owner-only, so the secret is never readable by others,
+        # not even between writing it and changing its mode.
+        descriptor = os.open(self.config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, 'wb') as f:
+            f.write(format_config(self.config).encode('utf-8'))
+
+    def check(self, code):
+        drift_backward = max(0, int(self.config['drift_backward']))
+        drift_forward = max(0, int(self.config['drift_forward']))
+
+        if not re.match(r'^\d+$', code):
+            return False
+        # Compared in constant time, so the timing says nothing about the code.
+        code = str(code)
+        for drift in range(-drift_backward, drift_forward + 1):
+            if hmac.compare_digest(code, self.totp(self.config['secret'], drift=drift)):
+                return True
+        return False
+
+    def totp(self, key, length=6, hash=hashlib.sha1, period=30, drift=0):
+        counter = int(int(time.time()) / period) + drift
+        return self.hotp(key, counter, length=length, hash=hash, drift=0)
+
+    def hotp(self, key, counter, length=6, hash=hashlib.sha1, drift=0):
+        counter = struct.pack('>Q', counter + drift)
+        key = base64.b32decode(key)
+
+        digest = bytearray(hmac.new(key, counter, hash).digest())
+
+        offset = digest[-1] & 0xF
+        value = struct.unpack('>L', bytes(digest[offset:offset + 4]))[0] & 0x7FFFFFFF
+        code = ('%010d' % value)[-length:]
+        return code
+
+class Login(Action):
+
+    def __init__(self):
+        super(Login, self).__init__()
+
+        # dump environ for debugging
+        if self.config['debug']:
+            for name, value in os.environ.items():
+              sys.stderr.write('%s = %s\n' % (name, value))
+
+        # setup timeout
+        signal.signal(signal.SIGALRM, self.fail)
+
+    def shell(self, command=''):
+        if command:
+            os.execl('/bin/bash', '/bin/bash', '-c', command)
+        else:
+            shell = os.environ['SHELL']
+            os.execl(shell, shell, '-l')
+        assert False
+
+    def success(self):
+        self.shell(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
+
+    def fail(self, *args, **kwargs):
+        os._exit(1)
+
+    def run(self):
+        # if not enabled, then simply run shell
+        if not self.config['enable']:
+            self.success()
+
+        # is the code set in environment?
+        code = os.environ.get('OTP', '')
+        if code:
+            if self.check(code):
+                self.success()
+            else:
+                self.fail()
+
+        # setup timeout
+        signal.alarm(self.config['timeout'])
+
+        # let user try until success or timeout
+        try:
+            while True:
+                # get code
+                sys.stderr.write('One-time password: ')
+                sys.stderr.flush()
+
+                code = read_line().strip()
+                if self.check(code):
+                    break
+
+                # delay
+                time.sleep(self.config['delay'])
+                sys.stderr.write('Incorrect code. Please try again.\n\n')
+
+        except:
+            self.fail()
+
+        # disable timeout
+        signal.alarm(0)
+
+        self.success()
+
+class Setup(Action):
+
+    def run(self):
+        sys.stdout.write('\n')
+
+        if not self.config['secret']:
+            self.generate()
+
+            sys.stdout.write('New one-time password secret\n')
+            sys.stdout.write('----------------------------\n')
+        else:
+            sys.stdout.write('Existing one-time password secret\n')
+            sys.stdout.write('---------------------------------\n')
+
+        self.display()
+
+        if self.config['enable']:
+            return
+
+        self.test()
+
+    def generate(self):
+        # 320 bit of entropy
+        secret = base64.b32encode(os.urandom(40)).decode('ascii')
+        self.config['secret'] = secret
+        self.save()
+
+    def display(self):
+        sys.stdout.write('Secret: %s\n' % self.config['secret'])
+
+        otpauth_url = 'otpauth://totp'
+        otpauth_url += quote('/ssh %s@%s' % (os.environ['USER'], socket.gethostname()))
+        otpauth_url += '?' + urlencode({
+            'secret': self.config['secret']
+        })
+        sys.stdout.write('URL: %s\n' % otpauth_url)
+        sys.stdout.write('Status: %s\n' % ('Enabled' if self.config['enable'] else 'Disabled'))
+        sys.stdout.write('\n')
+
+        # The QR code is drawn here rather than by a web service, which would
+        # receive the secret.
+        try:
+            subprocess.check_call(['qrencode', '-t', 'ANSIUTF8', otpauth_url])
+        except (OSError, subprocess.CalledProcessError):
+            sys.stdout.write('Install qrencode to show a QR code here, or type the secret\n')
+            sys.stdout.write('into your authenticator.\n')
+        sys.stdout.write('\n')
+
+    def test(self):
+        sys.stdout.write('To enable one-time password, please setup your authenticator.\n')
+
+        try:
+            while True:
+                # get code
+                sys.stderr.write('One-time password: ')
+                sys.stderr.flush()
+
+                code = read_line().strip()
+                if self.check(code):
+                    break
+
+                sys.stderr.write('Incorrect code. Please try again.\n\n')
+
+        except (KeyboardInterrupt, EOFError):
+            sys.stdout.write('\nFailed to enable one-time password.\n')
+            sys.stdout.write('Please rerun setup to try again.\n')
+            sys.exit(1)
+
+        self.config['enable'] = True
+        self.save()
+
+        sys.stdout.write('Successful! One-time password is now enabled.\n')
+        sys.exit(0)
+
+class Reset(Action):
+    def run(self):
+        self.config['secret'] = ''
+        self.config['enable'] = False
+        self.save()
+
+ACTIONS = {
+    'login': Login,
+    'setup': Setup,
+    'reset': Reset,
 }
 
-# Check if Python script exists and is readable
-if [ ! -f "$PYTHON_SCRIPT" ]; then
-    echo "Error: Python script not found: $PYTHON_SCRIPT" >&2
-    fallback_to_shell
-fi
+def parse_args():
+    parser = argparse.ArgumentParser(description='SSH One-time Password Authentication')
+    parser.add_argument('action', choices=sorted(ACTIONS.keys()))
+    return parser.parse_args()
 
-if [ ! -r "$PYTHON_SCRIPT" ]; then
-    echo "Error: Python script not readable: $PYTHON_SCRIPT" >&2
-    fallback_to_shell
-fi
+def main(args):
+    action_cls = ACTIONS[args.action]
+    action = action_cls()
+    action.run()
 
-# Try Python versions in order of preference
-for python_cmd in python3 python python2; do
-    if command -v "$python_cmd" >/dev/null 2>&1; then
-        # Test if we can actually execute the Python script
-        if "$python_cmd" -c "import sys; sys.exit(0)" 2>/dev/null; then
-            # Try to run the actual script, capture any errors
-            if "$python_cmd" "$PYTHON_SCRIPT" --help >/dev/null 2>&1; then
-                # Script runs successfully, execute it with arguments
-                exec "$python_cmd" "$PYTHON_SCRIPT" "$@"
-            else
-                echo "Warning: Python script failed to run" >&2
-                fallback_to_shell
-            fi
-        else
-            echo "Warning: Python interpreter '$python_cmd' failed basic test" >&2
-            continue
-        fi
-    fi
-done
-
-echo "Error: No working Python interpreter found (python3, python, or python2)" >&2
-fallback_to_shell
+if __name__ == '__main__':
+    main(parse_args())
